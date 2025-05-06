@@ -44,7 +44,7 @@ func main() {
 	laps := viper.GetInt("laps")
 	lapLen := viper.GetInt("lapLen")
 	penaltyLen := viper.GetInt("penaltyLen")
-	//firingLines := viper.GetInt("firingLines")
+	firingLines := viper.GetInt("firingLines")
 	startStr := viper.GetString("start")
 	startDeltaStr := viper.GetString("startDelta")
 
@@ -85,9 +85,7 @@ func main() {
 	}
 	defer fileResults.Close()
 
-	writeFinalReport(competitorsStats, fileResults, lapLen, penaltyLen)
-
-	logrus.Info("Обработка событий завершена. Результаты сохранены в файл resulting_table.")
+	writeFinalReport(competitorsStats, fileResults, lapLen, penaltyLen, firingLines)
 }
 
 func handleEvent(event string, competitorStats map[string]*competitorStat, start time.Time, startDelta time.Time, laps int) error {
@@ -130,13 +128,23 @@ func handleEvent(event string, competitorStats map[string]*competitorStat, start
 		}
 		stat.startTime = startTime
 		logrus.Infof("%s The start time for the competitor(%s) was set by a draw to %s", timeStr, idComp, startTimeStr)
-
 	case 3: // Участник на стартовой линии
 		logrus.Infof("%s The competitor(%s) is on the start line", timeStr, idComp)
 	case 4: // Участник стартовал
 		stat.actualStart = timeEv
 		stat.lapsTime = append(stat.lapsTime, [2]time.Time{timeEv})
 		logrus.Infof("%s The competitor(%s) has started", timeStr, idComp)
+
+		startDeltaDuration := time.Duration(startDelta.Hour())*time.Hour +
+			time.Duration(startDelta.Minute())*time.Minute +
+			time.Duration(startDelta.Second())*time.Second +
+			time.Duration(startDelta.Nanosecond())*time.Nanosecond
+		deadline := stat.startTime.Add(startDeltaDuration)
+		if stat.actualStart.After(deadline) {
+			stat.notStarted = true
+			stat.comment = "Дисквалифицирован: старт после допустимого времени"
+			logrus.Warnf("Участник %s дисквалифицирован: старт после допустимого времени (%s > %s).", idComp, stat.actualStart.Format(timeFormat), deadline.Format(timeFormat))
+		}
 	case 5: // Участник на огневом рубеже
 		firingRange := params[3]
 		logrus.Infof("%s The competitor(%s) is on the firing range(%s)", timeStr, idComp, firingRange)
@@ -157,6 +165,8 @@ func handleEvent(event string, competitorStats map[string]*competitorStat, start
 		logrus.Infof("%s The competitor(%s) ended the main lap", timeStr, idComp)
 		if len(stat.lapsTime) < laps {
 			stat.lapsTime = append(stat.lapsTime, [2]time.Time{timeEv})
+		} else {
+			stat.finishTime = timeEv
 		}
 	case 11: // Участник не может продолжать
 		comment := strings.Join(params[3:], " ")
@@ -168,31 +178,32 @@ func handleEvent(event string, competitorStats map[string]*competitorStat, start
 		logrus.Warnf("Неизвестный ID события: %s, событие: %s", idEvStr, event)
 	}
 
-	expectedStartTime := start.Add(time.Duration(convertStringToInt(idComp)-1) * startDelta.Sub(time.Time{}))
-	if stat.registered && stat.actualStart.IsZero() && timeEv.After(expectedStartTime.Add(time.Minute)) { //Добавил минуту запаса
-		stat.notStarted = true
-		logrus.Warnf("Участник %s дисквалифицирован: не стартовал вовремя.", idComp)
-	}
 	return nil
 }
 
-func writeFinalReport(competitorStats map[string]*competitorStat, file *os.File, lapLen int, penaltyLen int) {
+func writeFinalReport(competitorStats map[string]*competitorStat, file *os.File, lapLen, penaltyLen, firingLines int) {
 	var competitorIDs []string
 	for id := range competitorStats {
 		competitorIDs = append(competitorIDs, id)
 	}
 
 	sort.Slice(competitorIDs, func(i, j int) bool {
-		startTimeI := competitorStats[competitorIDs[i]].startTime
-		startTimeJ := competitorStats[competitorIDs[j]].startTime
-
-		if startTimeI.IsZero() && !startTimeJ.IsZero() {
-			return false
-		}
-		if !startTimeI.IsZero() && startTimeJ.IsZero() {
+		statI := competitorStats[competitorIDs[i]]
+		statJ := competitorStats[competitorIDs[j]]
+		if statI.notStarted {
 			return true
 		}
-		return startTimeI.Before(startTimeJ) // TODO: сорировать по тотальному времени
+		if statJ.notStarted {
+			return false
+		}
+		if statI.notFinished {
+			return true
+		}
+		if statJ.notFinished {
+			return false
+		}
+
+		return statI.finishTime.Sub(statI.actualStart) < statJ.finishTime.Sub(statJ.actualStart)
 	})
 
 	writer := bufio.NewWriter(file)
@@ -208,7 +219,11 @@ func writeFinalReport(competitorStats map[string]*competitorStat, file *os.File,
 			totalTimeStr = "[NotFinished]"
 		} else {
 			totalTime := stat.finishTime.Sub(stat.actualStart)
-			totalTimeStr = fmt.Sprintf("[%s]", totalTime) //TODO: format time
+			hours := int(totalTime.Hours())
+			minutes := int(totalTime.Minutes()) % 60
+			seconds := int(totalTime.Seconds()) % 60
+			milliseconds := totalTime.Milliseconds() % 1000
+			totalTimeStr = fmt.Sprintf("{%02d:%02d:%02d.%03d}", hours, minutes, seconds, milliseconds)
 		}
 
 		lapsTimeStr := "["
@@ -219,7 +234,12 @@ func writeFinalReport(competitorStats map[string]*competitorStat, file *os.File,
 				lapTime := lap[1].Sub(lap[0])
 				speed := float64(lapLen) / lapTime.Seconds()
 				stat.lapSpeeds = append(stat.lapSpeeds, speed)
-				lapsTimeStr += fmt.Sprintf("{%s, %.3f}", lapTime, speed)
+				hours := int(lapTime.Hours())
+				minutes := int(lapTime.Minutes()) % 60
+				seconds := int(lapTime.Seconds()) % 60
+				milliseconds := lapTime.Milliseconds() % 1000
+
+				lapsTimeStr += fmt.Sprintf("{%02d:%02d:%02d.%d, %.3f}", hours, minutes, seconds, milliseconds, speed)
 			}
 			if i < len(stat.lapsTime)-1 {
 				lapsTimeStr += ", "
@@ -235,7 +255,11 @@ func writeFinalReport(competitorStats map[string]*competitorStat, file *os.File,
 				penaltyTime := penalty[1].Sub(penalty[0])
 				speed := float64(penaltyLen) / penaltyTime.Seconds()
 				stat.penaltySpeeds = append(stat.penaltySpeeds, speed)
-				penaltyTimeStr += fmt.Sprintf("{%s, %.3f}", penaltyTime, speed)
+				hours := int(penaltyTime.Hours())
+				minutes := int(penaltyTime.Minutes()) % 60
+				seconds := int(penaltyTime.Seconds()) % 60
+				milliseconds := penaltyTime.Milliseconds() % 1000
+				penaltyTimeStr += fmt.Sprintf("{%02d:%02d:%02d.%03d, %.3f}", hours, minutes, seconds, milliseconds, speed)
 			}
 			if i < len(stat.penaltyTime)-1 {
 				penaltyTimeStr += ", "
@@ -243,14 +267,13 @@ func writeFinalReport(competitorStats map[string]*competitorStat, file *os.File,
 		}
 		penaltyTimeStr += "]"
 
-		resultString := fmt.Sprintf("%s %s %s %s %d/%d %s\n",
+		resultString := fmt.Sprintf("%s %s %s %s %d/%d\n",
 			totalTimeStr,
 			id,
 			lapsTimeStr,
 			penaltyTimeStr,
 			stat.hits,
-			5,
-			stat.comment,
+			5*firingLines,
 		)
 
 		_, err := writer.WriteString(resultString)
@@ -268,12 +291,4 @@ func initConfig() error {
 	viper.SetConfigType("json")
 
 	return viper.ReadInConfig()
-}
-
-func convertStringToInt(s string) int {
-	i, err := strconv.Atoi(s)
-	if err != nil {
-		return 0
-	}
-	return i
 }
